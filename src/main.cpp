@@ -2,7 +2,7 @@
 #include <DNSServer.h>
 #include <ESP8266WebServer.h>
 
-static const char AP_SSID[] = "Free WiFi";
+static const char AP_SSID[] = "Conservancy";
 static const char AP_PASS[] = "";
 static const IPAddress AP_IP(192, 168, 4, 1);
 static const byte DNS_PORT = 53;
