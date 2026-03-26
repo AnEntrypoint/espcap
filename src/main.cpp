@@ -3,52 +3,65 @@
 #include <ESP8266WebServer.h>
 #include <ESP8266HTTPClient.h>
 #include <WiFiClientSecure.h>
+#include <LittleFS.h>
 
 static const char AP_SSID[] = "Conservancy";
 static const char AP_PASS[] = "";
 static const IPAddress AP_IP(192, 168, 4, 1);
 static const byte DNS_PORT = 53;
-static const uint8_t MAX_ENTRIES = 50;
+static const char LOG_FILE[] = "/submissions.log";
 static const char WEBHOOK[] = "https://discord.com/api/webhooks/1486856273428348948/Efr97tx36cHAHlZakU388xa8sFGZbn-LZDAcZAkRZaUtfSes22QHqDe1FtrZjBgyBHEN";
-
-struct Entry {
-  String name;
-  String message;
-  unsigned long ms;
-};
 
 DNSServer dnsServer;
 ESP8266WebServer server(80);
-Entry entries[MAX_ENTRIES];
-uint8_t entryCount = 0;
 bool upstreamConnected = false;
 
-void flushToWebhook();
-
 void webhookSend(const String &content) {
-  if (!upstreamConnected) return;
   WiFiClientSecure client;
   client.setInsecure();
   HTTPClient http;
   http.begin(client, WEBHOOK);
   http.addHeader("Content-Type", "application/json");
-  String body = "{\"content\":\"" + content + "\"}";
+  String body = "{\"content\":\"";
+  for (char c : content) {
+    if (c == '"') body += "\\\"";
+    else if (c == '\\') body += "\\\\";
+    else if (c == '\n') body += "\\n";
+    else body += c;
+  }
+  body += "\"}";
   http.POST(body);
   http.end();
 }
 
+void flushToWebhook() {
+  if (!upstreamConnected) return;
+  File f = LittleFS.open(LOG_FILE, "r");
+  if (!f || f.size() == 0) { if (f) f.close(); return; }
+  String chunk = "";
+  while (f.available()) {
+    String line = f.readStringUntil('\n');
+    if (chunk.length() + line.length() + 1 > 1800) {
+      webhookSend(chunk);
+      chunk = "";
+    }
+    chunk += line + "\n";
+  }
+  f.close();
+  if (chunk.length()) webhookSend(chunk);
+  LittleFS.remove(LOG_FILE);
+}
+
 void tryUpstreamConnect() {
   Serial.println("Scanning for Conservancy upstream...");
+  WiFi.mode(WIFI_STA);
   int n = WiFi.scanNetworks();
   bool found = false;
   for (int i = 0; i < n; i++) {
     if (WiFi.SSID(i) == AP_SSID) { found = true; break; }
   }
-  if (!found) {
-    Serial.println("Conservancy upstream not found, running standalone AP");
-    return;
-  }
-  Serial.println("Found Conservancy upstream, connecting as STA...");
+  if (!found) { Serial.println("Upstream not found, standalone AP mode"); return; }
+  Serial.println("Found upstream, connecting...");
   WiFi.mode(WIFI_AP_STA);
   WiFi.begin(AP_SSID);
   unsigned long t = millis();
@@ -89,13 +102,11 @@ static const char HTML_THANKS[] PROGMEM = R"(<!DOCTYPE html>
 <meta http-equiv='refresh' content='3;url=/'>
 <title>Thanks</title>
 <style>body{font-family:sans-serif;max-width:480px;margin:40px auto;padding:0 16px;text-align:center}</style>
-</head><body>
-<h1>Thanks!</h1><p>Your entry was saved. Redirecting…</p>
+</head><body><h1>Thanks!</h1><p>Your entry was saved. Redirecting…</p>
 </body></html>)";
 
 String htmlEncode(const String &s) {
   String out;
-  out.reserve(s.length());
   for (char c : s) {
     if (c == '&') out += F("&amp;");
     else if (c == '<') out += F("&lt;");
@@ -108,22 +119,17 @@ String htmlEncode(const String &s) {
 
 void handleRoot() { server.send_P(200, "text/html", HTML_FORM); }
 
-void flushToWebhook() {
-  if (!upstreamConnected || entryCount == 0) return;
-  String content = "**Buffered submissions:**\\n";
-  for (uint8_t i = 0; i < entryCount; i++) {
-    content += "**" + entries[i].name + "**: " + entries[i].message + "\\n";
-  }
-  webhookSend(content);
-}
-
 void handleSubmit() {
   if (!server.hasArg("name") || !server.hasArg("message")) {
     server.sendHeader("Location", "/"); server.send(302); return;
   }
   String name = server.arg("name");
   String msg = server.arg("message");
-  if (entryCount < MAX_ENTRIES) entries[entryCount++] = {name, msg, millis()};
+  File f = LittleFS.open(LOG_FILE, "a");
+  if (f) {
+    f.printf("**%s**: %s\n", name.c_str(), msg.c_str());
+    f.close();
+  }
   Serial.printf("[submit] %s: %s\n", name.c_str(), msg.c_str());
   server.send_P(200, "text/html", HTML_THANKS);
 }
@@ -134,20 +140,17 @@ void handleSubmissions() {
     "<title>Entries</title>"
     "<style>body{font-family:sans-serif;max-width:600px;margin:40px auto;padding:0 16px}"
     ".entry{background:#fff;border:1px solid #ddd;border-radius:4px;padding:12px;margin:12px 0}"
-    ".name{font-weight:bold}.time{color:#999;font-size:12px}a{color:#0077cc}</style></head><body>"
-    "<h1>Guest Book Entries</h1>");
-  if (entryCount == 0) {
+    "a{color:#0077cc}</style></head><body><h1>Guest Book Entries</h1>");
+  File f = LittleFS.open(LOG_FILE, "r");
+  if (!f || f.size() == 0) {
     html += F("<p>No entries yet. <a href='/'>Be the first!</a></p>");
   } else {
-    for (int i = entryCount - 1; i >= 0; i--) {
-      html += F("<div class='entry'><div class='name'>");
-      html += htmlEncode(entries[i].name);
-      html += F("</div><div class='msg'>");
-      html += htmlEncode(entries[i].message);
-      html += F("</div><div class='time'>+");
-      html += String(entries[i].ms / 1000);
-      html += F("s uptime</div></div>");
+    while (f.available()) {
+      html += F("<div class='entry'>");
+      html += htmlEncode(f.readStringUntil('\n'));
+      html += F("</div>");
     }
+    f.close();
   }
   html += F("<p><a href='/'>Back to form</a></p></body></html>");
   server.send(200, "text/html", html);
@@ -156,20 +159,17 @@ void handleSubmissions() {
 void handleCaptiveRedirect() {
   server.sendHeader("Location", "http://192.168.4.1/"); server.send(302);
 }
-
 void handleGenerate204() { server.send(204); }
 
 void setup() {
   Serial.begin(115200);
-  WiFi.mode(WIFI_STA);
+  LittleFS.begin();
   tryUpstreamConnect();
   WiFi.softAPConfig(AP_IP, AP_IP, IPAddress(255, 255, 255, 0));
   WiFi.softAP(AP_SSID, AP_PASS[0] ? AP_PASS : nullptr);
   Serial.printf("AP started: SSID=%s IP=%s\n", AP_SSID, AP_IP.toString().c_str());
-
   dnsServer.setTTL(300);
   dnsServer.start(DNS_PORT, "*", AP_IP);
-
   server.on("/", HTTP_GET, handleRoot);
   server.on("/submit", HTTP_POST, handleSubmit);
   server.on("/submissions", HTTP_GET, handleSubmissions);
@@ -179,7 +179,6 @@ void setup() {
   server.on("/connecttest.txt", HTTP_GET, handleCaptiveRedirect);
   server.on("/redirect", HTTP_GET, handleCaptiveRedirect);
   server.onNotFound(handleCaptiveRedirect);
-
   server.begin();
   Serial.println("Web server started");
 }
