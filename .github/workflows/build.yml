@@ -1,0 +1,42 @@
+name: Build ESP8266 Firmware
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - '.pio/build/**'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install PlatformIO
+        run: pip install platformio
+
+      - name: Build firmware
+        run: pio run -e esp8266
+
+      - name: Commit and push firmware.bin
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          mkdir -p firmware
+          cp .pio/build/esp8266/firmware.bin firmware/firmware.bin
+          git add firmware/firmware.bin
+          git diff --cached --quiet && echo "No changes" && exit 0
+          git commit -m "ci: update firmware.bin [skip ci]"
+          git push
