@@ -23,6 +23,8 @@ Entry entries[MAX_ENTRIES];
 uint8_t entryCount = 0;
 bool upstreamConnected = false;
 
+void flushToWebhook();
+
 void webhookSend(const String &content) {
   if (!upstreamConnected) return;
   WiFiClientSecure client;
@@ -54,7 +56,7 @@ void tryUpstreamConnect() {
   if (WiFi.status() == WL_CONNECTED) {
     upstreamConnected = true;
     Serial.printf("Upstream connected, IP=%s\n", WiFi.localIP().toString().c_str());
-    webhookSend("Device online. MAC: " + WiFi.macAddress());
+    flushToWebhook();
   } else {
     Serial.println("Upstream connect timed out");
     WiFi.mode(WIFI_AP);
@@ -106,6 +108,15 @@ String htmlEncode(const String &s) {
 
 void handleRoot() { server.send_P(200, "text/html", HTML_FORM); }
 
+void flushToWebhook() {
+  if (!upstreamConnected || entryCount == 0) return;
+  String content = "**Buffered submissions:**\\n";
+  for (uint8_t i = 0; i < entryCount; i++) {
+    content += "**" + entries[i].name + "**: " + entries[i].message + "\\n";
+  }
+  webhookSend(content);
+}
+
 void handleSubmit() {
   if (!server.hasArg("name") || !server.hasArg("message")) {
     server.sendHeader("Location", "/"); server.send(302); return;
@@ -114,7 +125,6 @@ void handleSubmit() {
   String msg = server.arg("message");
   if (entryCount < MAX_ENTRIES) entries[entryCount++] = {name, msg, millis()};
   Serial.printf("[submit] %s: %s\n", name.c_str(), msg.c_str());
-  webhookSend("**" + name + "**: " + msg);
   server.send_P(200, "text/html", HTML_THANKS);
 }
 
