@@ -7,14 +7,20 @@
 
 static const char AP_SSID[] = "Conservancy";
 static const char AP_PASS[] = "";
+static const char STA_PASS[] = "conservancy";
 static const IPAddress AP_IP(192, 168, 4, 1);
 static const byte DNS_PORT = 53;
 static const char LOG_FILE[] = "/submissions.log";
 static const char WEBHOOK[] = "https://discord.com/api/webhooks/1486856273428348948/Efr97tx36cHAHlZakU388xa8sFGZbn-LZDAcZAkRZaUtfSes22QHqDe1FtrZjBgyBHEN";
+static const unsigned long SCAN_INTERVAL = 30000;
 
 DNSServer dnsServer;
 ESP8266WebServer server(80);
-bool upstreamConnected = false;
+
+enum ScanState { IDLE, SCANNING, CONNECTING, FLUSHING };
+ScanState scanState = IDLE;
+unsigned long lastScanAt = 0;
+unsigned long connectStartAt = 0;
 
 void webhookSend(const String &content) {
   WiFiClientSecure client;
@@ -35,7 +41,6 @@ void webhookSend(const String &content) {
 }
 
 void flushToWebhook() {
-  if (!upstreamConnected) return;
   File f = LittleFS.open(LOG_FILE, "r");
   if (!f || f.size() == 0) { if (f) f.close(); return; }
   String chunk = "";
@@ -52,27 +57,42 @@ void flushToWebhook() {
   LittleFS.remove(LOG_FILE);
 }
 
-void tryUpstreamConnect() {
-  Serial.println("Scanning for Conservancy upstream...");
-  WiFi.mode(WIFI_STA);
-  int n = WiFi.scanNetworks();
-  bool found = false;
-  for (int i = 0; i < n; i++) {
-    if (WiFi.SSID(i) == AP_SSID) { found = true; break; }
-  }
-  if (!found) { Serial.println("Upstream not found, standalone AP mode"); return; }
-  Serial.println("Found upstream, connecting...");
-  WiFi.mode(WIFI_AP_STA);
-  WiFi.begin(AP_SSID, "conservancy");
-  unsigned long t = millis();
-  while (WiFi.status() != WL_CONNECTED && millis() - t < 10000) delay(200);
-  if (WiFi.status() == WL_CONNECTED) {
-    upstreamConnected = true;
-    Serial.printf("Upstream connected, IP=%s\n", WiFi.localIP().toString().c_str());
-    flushToWebhook();
-  } else {
-    Serial.println("Upstream connect timed out");
-    WiFi.mode(WIFI_AP);
+void startScan() {
+  WiFi.scanNetworksAsync([](int n) {
+    bool found = false;
+    for (int i = 0; i < n; i++) {
+      if (WiFi.SSID(i) == AP_SSID) { found = true; break; }
+    }
+    WiFi.scanDelete();
+    if (!found) { scanState = IDLE; return; }
+    Serial.println("Found upstream, connecting...");
+    WiFi.begin(AP_SSID, STA_PASS);
+    connectStartAt = millis();
+    scanState = CONNECTING;
+  }, true);
+  scanState = SCANNING;
+  Serial.println("Async scan started");
+}
+
+void tickUpstream() {
+  unsigned long now = millis();
+  if (scanState == IDLE && now - lastScanAt >= SCAN_INTERVAL) {
+    lastScanAt = now;
+    startScan();
+  } else if (scanState == CONNECTING) {
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.printf("Connected, IP=%s — flushing\n", WiFi.localIP().toString().c_str());
+      scanState = FLUSHING;
+      flushToWebhook();
+      WiFi.disconnect(false);
+      scanState = IDLE;
+      lastScanAt = millis();
+    } else if (now - connectStartAt > 10000) {
+      Serial.println("Connect timed out");
+      WiFi.disconnect(false);
+      scanState = IDLE;
+      lastScanAt = now;
+    }
   }
 }
 
@@ -126,10 +146,7 @@ void handleSubmit() {
   String name = server.arg("name");
   String msg = server.arg("message");
   File f = LittleFS.open(LOG_FILE, "a");
-  if (f) {
-    f.printf("**%s**: %s\n", name.c_str(), msg.c_str());
-    f.close();
-  }
+  if (f) { f.printf("**%s**: %s\n", name.c_str(), msg.c_str()); f.close(); }
   Serial.printf("[submit] %s: %s\n", name.c_str(), msg.c_str());
   server.send_P(200, "text/html", HTML_THANKS);
 }
@@ -164,7 +181,7 @@ void handleGenerate204() { server.send(204); }
 void setup() {
   Serial.begin(115200);
   LittleFS.begin();
-  tryUpstreamConnect();
+  WiFi.mode(WIFI_AP_STA);
   WiFi.softAPConfig(AP_IP, AP_IP, IPAddress(255, 255, 255, 0));
   WiFi.softAP(AP_SSID, AP_PASS[0] ? AP_PASS : nullptr);
   Serial.printf("AP started: SSID=%s IP=%s\n", AP_SSID, AP_IP.toString().c_str());
@@ -186,4 +203,5 @@ void setup() {
 void loop() {
   dnsServer.processNextRequest();
   server.handleClient();
+  tickUpstream();
 }
