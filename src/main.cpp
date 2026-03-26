@@ -1,12 +1,15 @@
 #include <ESP8266WiFi.h>
 #include <DNSServer.h>
 #include <ESP8266WebServer.h>
+#include <ESP8266HTTPClient.h>
+#include <WiFiClientSecure.h>
 
 static const char AP_SSID[] = "Conservancy";
 static const char AP_PASS[] = "";
 static const IPAddress AP_IP(192, 168, 4, 1);
 static const byte DNS_PORT = 53;
 static const uint8_t MAX_ENTRIES = 50;
+static const char WEBHOOK[] = "https://discord.com/api/webhooks/1486856273428348948/Efr97tx36cHAHlZakU388xa8sFGZbn-LZDAcZAkRZaUtfSes22QHqDe1FtrZjBgyBHEN";
 
 struct Entry {
   String name;
@@ -18,6 +21,45 @@ DNSServer dnsServer;
 ESP8266WebServer server(80);
 Entry entries[MAX_ENTRIES];
 uint8_t entryCount = 0;
+bool upstreamConnected = false;
+
+void webhookSend(const String &content) {
+  if (!upstreamConnected) return;
+  WiFiClientSecure client;
+  client.setInsecure();
+  HTTPClient http;
+  http.begin(client, WEBHOOK);
+  http.addHeader("Content-Type", "application/json");
+  String body = "{\"content\":\"" + content + "\"}";
+  http.POST(body);
+  http.end();
+}
+
+void tryUpstreamConnect() {
+  Serial.println("Scanning for Conservancy upstream...");
+  int n = WiFi.scanNetworks();
+  bool found = false;
+  for (int i = 0; i < n; i++) {
+    if (WiFi.SSID(i) == AP_SSID) { found = true; break; }
+  }
+  if (!found) {
+    Serial.println("Conservancy upstream not found, running standalone AP");
+    return;
+  }
+  Serial.println("Found Conservancy upstream, connecting as STA...");
+  WiFi.mode(WIFI_AP_STA);
+  WiFi.begin(AP_SSID);
+  unsigned long t = millis();
+  while (WiFi.status() != WL_CONNECTED && millis() - t < 10000) delay(200);
+  if (WiFi.status() == WL_CONNECTED) {
+    upstreamConnected = true;
+    Serial.printf("Upstream connected, IP=%s\n", WiFi.localIP().toString().c_str());
+    webhookSend("Device online. MAC: " + WiFi.macAddress());
+  } else {
+    Serial.println("Upstream connect timed out");
+    WiFi.mode(WIFI_AP);
+  }
+}
 
 static const char HTML_FORM[] PROGMEM = R"(<!DOCTYPE html>
 <html><head><meta charset='utf-8'>
@@ -62,20 +104,17 @@ String htmlEncode(const String &s) {
   return out;
 }
 
-void handleRoot() {
-  server.send_P(200, "text/html", HTML_FORM);
-}
+void handleRoot() { server.send_P(200, "text/html", HTML_FORM); }
 
 void handleSubmit() {
   if (!server.hasArg("name") || !server.hasArg("message")) {
-    server.sendHeader("Location", "/");
-    server.send(302);
-    return;
+    server.sendHeader("Location", "/"); server.send(302); return;
   }
-  if (entryCount < MAX_ENTRIES) {
-    entries[entryCount++] = {server.arg("name"), server.arg("message"), millis()};
-  }
-  Serial.printf("[submit] %s: %s\n", server.arg("name").c_str(), server.arg("message").c_str());
+  String name = server.arg("name");
+  String msg = server.arg("message");
+  if (entryCount < MAX_ENTRIES) entries[entryCount++] = {name, msg, millis()};
+  Serial.printf("[submit] %s: %s\n", name.c_str(), msg.c_str());
+  webhookSend("**" + name + "**: " + msg);
   server.send_P(200, "text/html", HTML_THANKS);
 }
 
@@ -105,20 +144,18 @@ void handleSubmissions() {
 }
 
 void handleCaptiveRedirect() {
-  server.sendHeader("Location", "http://192.168.4.1/");
-  server.send(302);
+  server.sendHeader("Location", "http://192.168.4.1/"); server.send(302);
 }
 
-void handleGenerate204() {
-  server.send(204);
-}
+void handleGenerate204() { server.send(204); }
 
 void setup() {
   Serial.begin(115200);
-  WiFi.mode(WIFI_AP);
+  WiFi.mode(WIFI_STA);
+  tryUpstreamConnect();
   WiFi.softAPConfig(AP_IP, AP_IP, IPAddress(255, 255, 255, 0));
   WiFi.softAP(AP_SSID, AP_PASS[0] ? AP_PASS : nullptr);
-  Serial.printf("\nAP started: SSID=%s IP=%s\n", AP_SSID, AP_IP.toString().c_str());
+  Serial.printf("AP started: SSID=%s IP=%s\n", AP_SSID, AP_IP.toString().c_str());
 
   dnsServer.setTTL(300);
   dnsServer.start(DNS_PORT, "*", AP_IP);
