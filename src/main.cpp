@@ -63,7 +63,7 @@ void tryUpstreamConnect() {
   if (!found) { Serial.println("Upstream not found, standalone AP mode"); return; }
   Serial.println("Found upstream, connecting...");
   WiFi.mode(WIFI_AP_STA);
-  WiFi.begin(AP_SSID);
+  WiFi.begin(AP_SSID, "conservancy");
   unsigned long t = millis();
   while (WiFi.status() != WL_CONNECTED && millis() - t < 10000) delay(200);
   if (WiFi.status() == WL_CONNECTED) {
